@@ -23,7 +23,8 @@ class SavedAccountSettingFlyout(AppSettingFlyout):
         self._cards: dict[int, TextSettingCard] = {}
 
         hint = BodyLabel(
-            '为每个实例填写目标账号的掩码（例如 138******00），留空表示该实例不启用切号。'
+            '为每个实例填写登录列表中显示的完整掩码，例如 138******00 或 ab****12@example.com。'
+            '邮箱请带上域名，留空表示该实例不启用切号。'
             '修改后自动保存，当前实例立即生效；其它实例在切换过去时生效。'
             '这些掩码存在 plugin_data/zzz_saved_account/targets.json，不会写进主程序的账号配置。'
         )
@@ -37,7 +38,7 @@ class SavedAccountSettingFlyout(AppSettingFlyout):
                 title=f'实例 {instance.idx:02d} · {instance.name}{suffix}',
                 content='目标账号掩码',
                 margins=self.card_margins,
-                input_placeholder='例如 138******00',
+                input_placeholder='例如 138******00 或 ch****95@163.com',
             )
             card.setValue(self._read(instance.idx), emit_signal=False)
             card.value_changed.connect(

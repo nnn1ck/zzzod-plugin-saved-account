@@ -27,6 +27,7 @@ import copy
 import functools
 import re
 import time
+import unicodedata
 from dataclasses import dataclass, field
 
 from cv2.typing import MatLike
@@ -80,6 +81,8 @@ ENTER_GAME_RECT = Rect(850, 600, 1160, 780)
 
 # 掩码手机号里允许出现的字符
 MASK_CHARS = frozenset('0123456789*')
+_EMAIL_FRAGMENT = re.compile(r"[a-z0-9.!#$%&'*+/=?^_`{|}~@-]+")
+_EMAIL_MASK = re.compile(r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@(?:[a-z0-9-]+\.)+[a-z0-9-]+")
 
 # OCR 常见形近字纠正，避免数字被识别成形近字母
 _LOOKALIKE = str.maketrans({
@@ -101,7 +104,7 @@ STATUS_PATCHED = '已保存账号补丁已生效'
 class AccountRow:
     """弹窗里的一行登录记录。"""
 
-    items: list[tuple[int, str]] = field(default_factory=list)
+    items: list[tuple[int, str]] = field(default_factory=list, repr=False)
     left: int = 0
     top: int = 0
     right: int = 0
@@ -137,9 +140,6 @@ class AccountRow:
     def center(self) -> Point:
         return Point((self.left + self.right) // 2, (self.top + self.bottom) // 2)
 
-    def __repr__(self) -> str:
-        return f'AccountRow(text={self.text!r}, digits={self.digits!r}, top={self.top})'
-
 
 def _is_mask_box(text: str) -> bool:
     """判断一段 OCR 文本是否属于「掩码手机号」的一部分。"""
@@ -150,28 +150,40 @@ def _is_mask_box(text: str) -> bool:
     return mask_count >= 3 and mask_count / len(chars) >= 0.6
 
 
-def extract_rows(results: list[OcrMatchResult]) -> list[AccountRow]:
-    """把 OCR 结果按行聚合成登录记录。
+def _normalize_email(text: str) -> str:
+    return ''.join(unicodedata.normalize('NFKC', text).lower().split())
 
-    OCR 会把一行号码拆成多段（例如 ``138`` 和 ``*00``），所以先按 y 方向
-    重叠聚合，再按 x 排序拼接成完整号码。
-    """
-    boxes = [r for r in results if _is_mask_box(r.data or '')]
-    boxes.sort(key=lambda r: (r.y, r.x))
+
+def _is_masked_email(text: str) -> bool:
+    return '*' in text and _EMAIL_MASK.fullmatch(text) is not None
+
+
+def extract_rows(results: list[OcrMatchResult], *, email: bool = False) -> list[AccountRow]:
+    """按 OCR 框的位置聚合登录记录。邮箱片段还须在水平方向相邻。"""
+    if email:
+        boxes = [r for r in results if _EMAIL_FRAGMENT.fullmatch(_normalize_email(r.data or ''))]
+        boxes.sort(key=lambda r: (r.x, r.y))
+    else:
+        boxes = [r for r in results if _is_mask_box(r.data or '')]
+        boxes.sort(key=lambda r: (r.y, r.x))
 
     rows: list[AccountRow] = []
     for box in boxes:
         for row in rows:
             overlap = min(row.bottom, box.y + box.h) - max(row.top, box.y)
             min_height = min(row.bottom - row.top, box.h)
-            if overlap > 0.5 * min_height:
-                row.add(box)
-                break
+            if overlap <= 0.5 * min_height:
+                continue
+            if email and not -0.5 * min_height <= box.x - row.right <= min_height:
+                continue
+            row.add(box)
+            break
         else:
             rows.append(AccountRow.from_box(box))
 
-    rows.sort(key=lambda r: r.top)
-    return rows
+    if email:
+        rows = [row for row in rows if _is_masked_email(_normalize_email(row.text))]
+    return sorted(rows, key=lambda r: r.top)
 
 
 def looks_like_dialog(rows: list[AccountRow]) -> bool:
@@ -189,7 +201,7 @@ def looks_like_dialog(rows: list[AccountRow]) -> bool:
 
 
 def pick_row(rows: list[AccountRow], target: str) -> AccountRow | None:
-    """选出目标账号所在的行。
+    """选出目标手机号所在的行。
 
     弹窗最上面一行是「当前账号」摘要，会和下面已保存记录显示同一个号码，
     因此同一号码出现多次时取最靠下的一行（真正的登录记录）。
@@ -260,7 +272,7 @@ def _bump(op, name: str) -> int:
     return value
 
 
-def _detect_page(op, screen: MatLike) -> tuple[list[AccountRow], set[str]]:
+def _detect_page(op, screen: MatLike, target: str) -> tuple[list[AccountRow], set[str]]:
     """识别画面：返回按行聚合的登录记录，以及账号弹窗和退出确认框里的全部文本。"""
     if screen is None:
         return [], set()
@@ -277,7 +289,7 @@ def _detect_page(op, screen: MatLike) -> tuple[list[AccountRow], set[str]]:
     )
     texts = {result.data or '' for result in dialog_results}
     texts.update(result.data or '' for result in logout_results)
-    return extract_rows(dialog_results), texts
+    return extract_rows(dialog_results, email='@' in _normalize_email(target)), texts
 
 
 def _find_text_in(op, rect: Rect, *keywords: str) -> OcrMatchResult | None:
@@ -352,7 +364,14 @@ def _handle_saved_account_dialog(op, rows: list[AccountRow], target: str) -> Ope
 
     日志和节点状态里都不写具体账号：只写识别到几条记录，方便用户直接贴日志。
     """
-    row = pick_row(rows, target)
+    email_target = _normalize_email(target)
+    if '@' in email_target:
+        matches = _matching_email_rows(op, rows, email_target)
+        if len(matches) > 1:
+            return op.round_fail(f'邮箱掩码无法唯一定位（匹配到 {len(matches)} 条记录）')
+        row = matches[0] if matches else None
+    else:
+        row = pick_row(rows, target)
     if row is None:
         _bump(op, '_saved_account_tries')
         status = f'未找到目标账号（画面中识别到 {len(rows)} 条登录记录）'
@@ -370,7 +389,7 @@ def _handle_saved_account_dialog(op, rows: list[AccountRow], target: str) -> Ope
     if _counter(op, '_saved_account_clicks') > MAX_TRIES:
         return op.round_fail(f'点击目标账号无效（画面中识别到 {len(rows)} 条登录记录）')
 
-    log.info('检测到已保存账号弹窗，点选目标账号 (位置 %s)', row.center)
+    log.info('检测到已保存账号弹窗，点选目标账号（画面中识别到 %s 条登录记录）', len(rows))
     op.ctx.controller.click(row.center)
     op._saved_account_last_click = now
     op._saved_account_tries = 0
@@ -445,21 +464,33 @@ def _find_text_center(op, screen: MatLike, rect: Rect, keyword: str) -> Point | 
     return None
 
 
-def _find_dropdown_icon(op, screen: MatLike) -> Point | None:
-    """在登录页账号行右侧找「展开账号列表」的下拉箭头。"""
+def _find_dropdown_icon(op, screen: MatLike, *, expanded: bool = False) -> Point | None:
+    """在登录页账号行右侧找展开或收起箭头。"""
     if screen is None:
         return None
     part = cv2_utils.crop_image_only(screen, ACCOUNT_DROPDOWN_CROP)
+    template_id = 'account_dropdown_collapse' if expanded else 'account_dropdown_expand'
+    threshold = 0.9 if expanded else 0.75
     try:
-        mrl = op.ctx.tm.match_template(
-            part, 'enter_game', 'account_dropdown_expand', threshold=0.75
-        )
+        mrl = op.ctx.tm.match_template(part, 'enter_game', template_id, threshold=threshold)
     except Exception:
         log.error('匹配账号下拉箭头失败', exc_info=True)
         return None
     if mrl.max is None:
         return None
     return mrl.max.center + ACCOUNT_DROPDOWN_CROP.left_top
+
+
+def _matching_email_rows(op, rows: list[AccountRow], target: str) -> list[AccountRow]:
+    if not _is_masked_email(target):
+        return []
+    matches = [row for row in rows if _normalize_email(row.text) == target]
+    if len(matches) > 1 and matches[0] is rows[0]:
+        summary = rows[0]
+        arrow = _find_dropdown_icon(op, op.last_screenshot, expanded=True)
+        if arrow is not None and arrow.x > summary.right and summary.top <= arrow.y <= summary.bottom:
+            return matches[1:]
+    return matches
 
 
 def _handle_login_page(op, texts: set[str], target: str) -> OperationRoundResult | None:
@@ -512,7 +543,7 @@ def _check_saved_account_pages(op, allow_title_switch: bool = False) -> Operatio
     if target == '' or op.last_screenshot is None:
         return None
 
-    rows, texts = _detect_page(op, op.last_screenshot)
+    rows, texts = _detect_page(op, op.last_screenshot, target)
 
     if _is_logout_dialog(texts):
         return _handle_logout_dialog(op)
@@ -604,9 +635,10 @@ def _impl_more_logout_confirm(op) -> OperationRoundResult | None:
     新版游戏的退出确认框是「退出并清除/保留登录记录 + 取消/确定」，原生只认
     一个文字为「确认」的按钮，对不上就一直重试，所以这里直接按确认框处理。
     """
-    if _read_saved_account(op) == '':
+    target = _read_saved_account(op)
+    if target == '':
         return None
-    _, texts = _detect_page(op, op.last_screenshot)
+    _, texts = _detect_page(op, op.last_screenshot, target)
     if _is_logout_dialog(texts):
         return _handle_logout_dialog(op)
     return None
@@ -618,9 +650,10 @@ def _impl_wait_switch_can_click(op) -> OperationRoundResult | None:
     登出后游戏直接弹已保存账号列表，标题界面的「点击进入游戏」会被弹窗盖住，
     原生在这里会一直重试 20 次然后失败，所以弹窗一出现就直接放行给 EnterGame。
     """
-    if _read_saved_account(op) == '':
+    target = _read_saved_account(op)
+    if target == '':
         return None
-    rows, texts = _detect_page(op, op.last_screenshot)
+    rows, texts = _detect_page(op, op.last_screenshot, target)
     if looks_like_dialog(rows):
         return op.round_success('已出现已保存账号列表', wait=1)
     if _is_logout_dialog(texts) or _is_credential_page(texts):
